@@ -152,6 +152,7 @@ class TransformersGenerator(UnifiedGenerator):
         enable_thinking: bool = False,
     ):
         self.model, self.model_str = model_from_hf_path(model)
+        self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_str,
             trust_remote_code=trust_remote_code,
@@ -198,8 +199,19 @@ class TransformersGenerator(UnifiedGenerator):
 
         _, seq_length = inputs["input_ids"].shape
         max_cache_len = max(
-            seq_length + params.max_new_tokens + 8, 2 * params.max_new_tokens
+            seq_length + params.max_new_tokens + 8, params.max_new_tokens * 2
         )
+        use_uncompiled_decode = max_cache_len > params.max_new_tokens * 2
+        active_decode_impl = (
+            decode_one_token if use_uncompiled_decode else self._decode_impl
+        )
+        if use_uncompiled_decode and on_text:
+            on_text(
+                f"\n[Warning: Current context length ({seq_length}) + max_new_tokens "
+                f"({params.max_new_tokens}) exceeds the default cache size. CUDA Graphs "
+                "not captured; this may cause performance degradation. Please consider "
+                "using the vLLM backend instead.]\n"
+            )
         past_kv = StaticCache(
             self.model.config,
             1,
@@ -253,7 +265,7 @@ class TransformersGenerator(UnifiedGenerator):
             with torch.nn.attention.sdpa_kernel(
                 backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
             ):
-                next_token, _ = self._decode_impl(
+                next_token, _ = active_decode_impl(
                     self.model,
                     next_token.clone(),
                     past_kv,

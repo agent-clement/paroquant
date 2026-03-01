@@ -85,7 +85,7 @@ async def run_chat_app(config: ChatAppConfig):
         theme=Theme(
             {
                 "user": "bold cyan",
-                "assistant": "bold green",
+                "assistant": "bold blue",
                 "hint": "dim",
             }
         )
@@ -108,7 +108,9 @@ async def run_chat_app(config: ChatAppConfig):
 
     if config.backend == "transformers" and config.compile_decode:
         warmup_params = GenerationParams(
-            max_new_tokens=min(8, config.max_new_tokens),
+            # Need to warmup with with exact same max_new_tokens to trigger
+            # compilation of the target cache size.
+            max_new_tokens=config.max_new_tokens,
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
