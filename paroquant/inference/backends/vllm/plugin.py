@@ -27,6 +27,133 @@ logger = init_logger(__name__)
 _SHARD_INDEX = {"q": 0, "k": 1, "v": 2}
 _QUANT_TYPE = {4: scalar_types.uint4}
 _MARLIN_TILE_N = 64
+_LEGACY_SUFFIX_ALIASES = {
+    "mlp.shared_expert_gate": "mlp.shared_expert.gate_proj",
+}
+
+
+def _patch_qwen35_rope_validation_compat() -> None:
+    """Patch only Qwen 3.5 vLLM config classes for transformers>=5.4."""
+
+    candidates: list[type] = []
+    try:
+        from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
+
+        candidates.append(Qwen3_5TextConfig)
+    except Exception:
+        pass
+
+    try:
+        from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+
+        candidates.append(Qwen3_5MoeTextConfig)
+    except Exception:
+        pass
+
+    for cls in candidates:
+        original = cls._check_received_keys
+        if getattr(original, "_paroquant_qwen35_patched", False):
+            continue
+
+        def _wrapped(rope_type, received_keys, required_keys, optional_keys=None, ignore_keys=None, *, _orig=original):
+            if ignore_keys is not None and not isinstance(ignore_keys, set):
+                ignore_keys = set(ignore_keys)
+            return _orig(rope_type, received_keys, required_keys, optional_keys, ignore_keys)
+
+        _wrapped._paroquant_qwen35_patched = True  # type: ignore[attr-defined]
+        cls._check_received_keys = staticmethod(_wrapped)
+
+
+_patch_qwen35_rope_validation_compat()
+
+
+def _strip_module_name(name: str) -> str:
+    name = name.removeprefix("model.")
+    i = name.find("layers.")
+    return name[i:] if i >= 0 else name
+
+
+def _suffix_after_layers(name: str) -> str:
+    name = name.removeprefix("model.")
+    parts = name.split(".")
+    if "layers" in parts:
+        idx = parts.index("layers")
+        if idx + 2 < len(parts):
+            return ".".join(parts[idx + 2 :])
+    return name
+
+
+def _canonicalize_skip_list(
+    ignored_layers: list[str],
+    fused_mapping: dict[str, list[str]],
+) -> list[str]:
+    canonical: list[str] = []
+    seen: set[str] = set()
+    packed_requests: dict[str, set[str]] = {}
+
+    def add(name: str) -> None:
+        if name and name not in seen:
+            seen.add(name)
+            canonical.append(name)
+
+    for raw_name in ignored_layers:
+        suffix = _suffix_after_layers(raw_name)
+        suffix = _LEGACY_SUFFIX_ALIASES.get(suffix, suffix)
+
+        # Legacy shorthand like "mlp.gate" is ambiguous with the fused
+        # gate_up_proj path in vLLM. Drop it instead of letting substring
+        # matching partially skip a packed layer.
+        if suffix.endswith(".gate"):
+            logger.warning(
+                "Ignoring legacy modules_to_not_convert entry %r; use an exact module name instead.",
+                raw_name,
+            )
+            continue
+
+        if suffix.endswith(".in_proj_a") or suffix.endswith(".in_proj_b"):
+            base, shard = suffix.rsplit(".", 1)
+            packed_name = f"{base}.in_proj_ba"
+            packed_requests.setdefault(packed_name, set()).add(shard)
+            continue
+
+        add(suffix)
+
+    if "in_proj_ba" in fused_mapping:
+        all_shards = set(fused_mapping["in_proj_ba"])
+        for packed_name, requested in packed_requests.items():
+            if requested == all_shards:
+                add(packed_name)
+            else:
+                raise ValueError(
+                    f"Illegal partial modules_to_not_convert entry for {packed_name}: "
+                    f"expected all of {sorted(all_shards)}, got {sorted(requested)}"
+                )
+
+    return canonical
+
+
+def _merge_inferred_modules_to_not_convert(
+    metadata: dict[str, dict[str, Any]],
+    *,
+    safetensors_dtypes: dict[str, Any],
+    unquant_dtypes: list[Any],
+    existing: list[str] | None = None,
+) -> list[str]:
+    leaf_modules = {key.rsplit(".", 1)[0] for key in metadata if key.endswith(".weight")}
+    quant_modules = {
+        key.rsplit(".", 1)[0]
+        for key, info in metadata.items()
+        if (dtype_name := info.get("dtype")) and safetensors_dtypes[dtype_name] not in unquant_dtypes
+    }
+    inferred = {_strip_module_name(name) for name in leaf_modules - quant_modules}
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for name in [*(existing or []), *sorted(inferred)]:
+        if name and name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return merged
 
 
 def _rotation_weight_loader(
@@ -66,6 +193,7 @@ class ParoQuantConfig(QuantizationConfig):
         self.pack_factor = 32 // bits
         self.quant_type = _QUANT_TYPE[bits]
         self.modules_to_not_convert = modules_to_not_convert or []
+        self._skip_list_canonicalized = False
 
     def __repr__(self) -> str:
         return f"ParoQuantConfig(bits={self.bits}, group_size={self.group_size}, krot={self.krot})"
@@ -96,37 +224,29 @@ class ParoQuantConfig(QuantizationConfig):
         )
 
     def maybe_update_config(self, model_name: str, revision: str | None = None):
-        """Auto-detect unquantized layers from safetensors metadata."""
-        if self.modules_to_not_convert:
-            return
+        """Merge config-provided skips with unquantized layers inferred from safetensors metadata."""
 
         from safetensors.torch import _TYPES as _SF_DTYPES
 
         unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
         metadata = get_safetensors_params_metadata(model_name, revision=revision)
-
-        # Only consider leaf modules (those with ".weight"), not containers
-        # that have scalar FP16 params (e.g. A_log) which would false-match.
-        leaf_modules = {k.rsplit(".", 1)[0] for k in metadata if k.endswith(".weight")}
-        quant_modules: set[str] = {
-            k.rsplit(".", 1)[0]
-            for k, info in metadata.items()
-            if (dt := info.get("dtype")) and _SF_DTYPES[dt] not in unquant_dtypes
-        }
-        # Strip to "layers.N..." suffix so vLLM's substr matching works
-        # regardless of model nesting depth (safetensors may store
-        # "model.language_model.layers.0.X" while vLLM uses
-        # "language_model.model.layers.0.X").
-        def _strip(name: str) -> str:
-            name = name.removeprefix("model.")
-            i = name.find("layers.")
-            return name[i:] if i >= 0 else name
-
-        self.modules_to_not_convert = [_strip(k) for k in leaf_modules - quant_modules]
+        self.modules_to_not_convert = _merge_inferred_modules_to_not_convert(
+            metadata,
+            safetensors_dtypes=_SF_DTYPES,
+            unquant_dtypes=unquant_dtypes,
+            existing=self.modules_to_not_convert,
+        )
+        self._skip_list_canonicalized = False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase | None:
         if not isinstance(layer, LinearBase):
             return None
+        if not self._skip_list_canonicalized:
+            self.modules_to_not_convert = _canonicalize_skip_list(
+                self.modules_to_not_convert,
+                dict(self.packed_modules_mapping),
+            )
+            self._skip_list_canonicalized = True
         if is_layer_skipped(prefix, self.modules_to_not_convert, self.packed_modules_mapping, skip_with_substr=True):
             return UnquantizedLinearMethod()
         if not check_marlin_supports_layer(layer, self.group_size):

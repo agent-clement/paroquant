@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import nullcontext
 from collections.abc import Callable, Iterator
 from copy import deepcopy
 from typing import Literal
@@ -123,7 +124,18 @@ def optimize_module(
         for param_group in optim_params
     ]
     optimizer = torch.optim.AdamW(optim_params)
-    scaler = torch.amp.GradScaler()
+    try:
+        module_dtype = next(module.parameters()).dtype
+    except StopIteration:
+        module_dtype = torch.float32
+    autocast_dtype = None
+    use_grad_scaler = False
+    if module_dtype == torch.float16:
+        autocast_dtype = torch.float16
+        use_grad_scaler = True
+    elif module_dtype == torch.bfloat16:
+        autocast_dtype = torch.bfloat16
+    scaler = torch.amp.GradScaler(enabled=use_grad_scaler)
     if loss_fn == "mse":
         loss = nn.MSELoss()
     elif loss_fn == "smooth_l1":
@@ -139,11 +151,16 @@ def optimize_module(
             out = out[0]
         return out
 
+    def autocast_context():
+        if autocast_dtype is None:
+            return nullcontext()
+        return torch.amp.autocast("cuda", dtype=autocast_dtype)
+
     @torch.no_grad()
     def loss_batches(input_batches: Iterator[torch.Tensor], output_batches: Iterator[torch.Tensor]) -> torch.Tensor:
         total_loss = None
         for input_batch, output_batch in zip(input_batches, output_batches):
-            with torch.amp.autocast("cuda"):
+            with autocast_context():
                 output_q = module_output(input_batch)
             loss_value = loss(output_batch, output_q)
             if total_loss is None:
@@ -182,7 +199,7 @@ def optimize_module(
                 remaining_batches = num_train_batches - batch_idx + 1
                 window_size = min(gradient_accumulation_steps, remaining_batches)
 
-            with torch.amp.autocast("cuda"):
+            with autocast_context():
                 output_q = module_output(input_batch)
                 batch_loss = loss(output_batch, output_q)
                 loss_value = batch_loss / window_size

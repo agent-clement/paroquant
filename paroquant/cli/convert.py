@@ -7,20 +7,85 @@ from typing import Any
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
 from paroquant.optim.util import get_named_linears, set_module_by_name
 
 _AWQ_REORDER = (0, 2, 4, 6, 1, 3, 5, 7)
 _LAYER_PATHS = ["model.layers", "model.language_model.layers", "language_model.layers"]
+_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
-def _load_model(model_id: str, device_map: str = "cpu") -> torch.nn.Module:
-    kwargs = dict(torch_dtype=torch.float16, device_map=device_map, low_cpu_mem_usage=True, trust_remote_code=True)
+def _parse_dtype_arg(dtype: str) -> torch.dtype | str:
+    if dtype == "auto":
+        return "auto"
+    return _DTYPES[dtype]
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    for name, value in _DTYPES.items():
+        if value == dtype:
+            return name
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _get_model_dtype(model: torch.nn.Module) -> torch.dtype:
+    for tensor in model.parameters():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    for tensor in model.buffers():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
+def _canonicalize_tensor_key(key: str) -> str:
+    if key.startswith("model.language_model.visual."):
+        key = "model.visual." + key.removeprefix("model.language_model.visual.")
+    elif key.startswith("model.language_model.language_model.language_model."):
+        key = "model.language_model." + key.removeprefix("model.language_model.language_model.language_model.")
+
+    parts = key.split(".")
+    canonical = []
+    for part in parts:
+        if part == "language_model" and canonical and canonical[-1] == "language_model":
+            continue
+        canonical.append(part)
+    return ".".join(canonical)
+
+
+def _canonicalize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    canonical: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        canonical_key = _canonicalize_tensor_key(key)
+        if canonical_key in canonical and canonical_key != key:
+            raise ValueError(f"State dict key collision after canonicalization: {key} -> {canonical_key}")
+        canonical[canonical_key] = value
+    return canonical
+
+
+def _load_model(model_id: str, device_map: str = "cpu", dtype: torch.dtype | str = "auto") -> torch.nn.Module:
+    kwargs = dict(dtype=dtype, device_map=device_map, low_cpu_mem_usage=True, trust_remote_code=True)
     try:
         return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
     except (ValueError, KeyError):
         return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+
+
+def _save_preprocessors(model_id: str, output_path: Path) -> None:
+    try:
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        processor.save_pretrained(output_path)
+        if getattr(processor, "image_processor", None) is not None:
+            processor.image_processor.save_pretrained(output_path)
+        if getattr(processor, "video_processor", None) is not None:
+            processor.video_processor.save_pretrained(output_path)
+    except Exception:
+        AutoTokenizer.from_pretrained(model_id, trust_remote_code=True).save_pretrained(output_path)
 
 
 def _get_blocks(model: torch.nn.Module):
@@ -85,7 +150,7 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
 
 
 @torch.no_grad()
-def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tensor], int, int, int]:
+def _quantize_layer(state_dict: dict, device: str, buffer_dtype: torch.dtype) -> tuple[dict[str, torch.Tensor], int, int, int]:
     from paroquant.kernels.cuda import scaled_pairwise_rotation
 
     weight = state_dict["weight"].to(device=device, dtype=torch.float32)
@@ -118,26 +183,26 @@ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tens
         .reshape(out_features, in_features)
     )
 
-    channel_scales = (1.0 / channel_scales_opt).to(torch.float16).cpu()
+    channel_scales = (1.0 / channel_scales_opt).to(buffer_dtype).cpu()
     if channel_scales.ndim == 1:
         channel_scales = channel_scales.unsqueeze(0)
 
     buffers: dict[str, torch.Tensor] = {
         "qweight": _pack_awq(quantized.T.contiguous()).cpu(),
         "qzeros": _pack_awq(zero_points.to(torch.int32).reshape(out_features, n_groups).T.contiguous()).cpu(),
-        "scales": scales_flat.reshape(out_features, n_groups).T.contiguous().to(torch.float16).cpu(),
-        "theta": theta.to(torch.float16).cpu(),
+        "scales": scales_flat.reshape(out_features, n_groups).T.contiguous().to(buffer_dtype).cpu(),
+        "theta": theta.to(buffer_dtype).cpu(),
         "pairs": pairs.cpu(),
         "channel_scales": channel_scales,
     }
     if "bias" in state_dict and state_dict["bias"] is not None:
-        buffers["bias"] = state_dict["bias"].to(torch.float16).cpu()
+        buffers["bias"] = state_dict["bias"].to(buffer_dtype).cpu()
 
     return buffers, bits, group_size, int(theta.shape[0])
 
 
 @torch.no_grad()
-def _convert_real(model: torch.nn.Module, result_dir: Path) -> tuple[int, dict[str, Any]]:
+def _convert_real(model: torch.nn.Module, result_dir: Path, *, buffer_dtype: torch.dtype) -> tuple[int, dict[str, Any]]:
     from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
 
     blocks = _get_blocks(model)
@@ -151,7 +216,7 @@ def _convert_real(model: torch.nn.Module, result_dir: Path) -> tuple[int, dict[s
                 continue
 
             sd = torch.load(pt_file, map_location="cpu", weights_only=False)
-            buffers, bits, group_size, krot = _quantize_layer(sd, device="cuda")
+            buffers, bits, group_size, krot = _quantize_layer(sd, device="cuda", buffer_dtype=buffer_dtype)
 
             rl = RotateQuantizedLinear(
                 module.in_features,
@@ -161,6 +226,7 @@ def _convert_real(model: torch.nn.Module, result_dir: Path) -> tuple[int, dict[s
                 bits=bits,
                 krot=krot,
             )
+            rl = rl.to(dtype=buffer_dtype)
             rl.load_state_dict(buffers, strict=False)
             set_module_by_name(layer, name, rl)
             count += 1
@@ -173,6 +239,7 @@ def _convert_real(model: torch.nn.Module, result_dir: Path) -> tuple[int, dict[s
         "bits": bits,
         "group_size": group_size,
         "krot": krot,
+        "storage_dtype": _dtype_name(buffer_dtype),
     }
     return count, quant_config
 
@@ -184,6 +251,7 @@ def main() -> None:
     parser.add_argument("--result-dir", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--mode", choices=["real", "pseudo"], default="real")
+    parser.add_argument("--dtype", choices=["auto", *_DTYPES], default="auto")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -193,12 +261,14 @@ def main() -> None:
     if not result_dir.is_dir():
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
 
-    model = _load_model(args.model, device_map="cpu" if args.mode == "real" else "cuda")
+    load_dtype = _parse_dtype_arg(args.dtype)
+    model = _load_model(args.model, device_map="cpu" if args.mode == "real" else "cuda", dtype=load_dtype)
+    export_dtype = _get_model_dtype(model) if load_dtype == "auto" else load_dtype
 
     if args.mode == "pseudo":
         count = _convert_pseudo(model, result_dir)
     else:
-        count, quant_config = _convert_real(model, result_dir)
+        count, quant_config = _convert_real(model, result_dir, buffer_dtype=export_dtype)
         args_json = result_dir / "args.json"
         if args_json.exists():
             skipped = json.loads(args_json.read_text()).get("skipped_modules", [])
@@ -211,8 +281,9 @@ def main() -> None:
 
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output_path)
-    AutoTokenizer.from_pretrained(args.model).save_pretrained(output_path)
+    state_dict = _canonicalize_state_dict_keys(model.state_dict())
+    model.save_pretrained(output_path, state_dict=state_dict, save_original_format=False)
+    _save_preprocessors(args.model, output_path)
 
     print(f"Converted {count} layers ({args.mode}) → {output_path}")
 

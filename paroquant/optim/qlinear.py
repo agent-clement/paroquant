@@ -30,7 +30,7 @@ class PseudoQuantizedLinear(nn.Module):
         self.out_feat = self.weight.shape[0]
         num_groups = self.in_feat // group_size
         assert self.in_feat % group_size == 0
-        assert self.weight.dtype == torch.float16 or self.weight.dtype == torch.float32
+        assert self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         if rotation_pairs is not None:
             pairs_grouped, angles_grouped, mask = rotation_pairs
             assert pairs_grouped.size(0) == num_rotations
@@ -142,17 +142,18 @@ class PseudoQuantizedLinear(nn.Module):
 
         if quantizer and self.quantizer is None:
             # Initialize the quantizer with the current rotated weight
-            weight = self.weight
-            if self.channel_scales is not None:
-                weight = weight * self.channel_scales.view(1, -1)
-            if self.pairs_grouped is not None:
-                weight = scaled_pairwise_rotation(
-                    weight,
-                    self.pairs_grouped,
-                    self.angles_grouped,
-                    None,
-                    self.group_size,
-                )
+            with torch.no_grad():
+                weight = self.weight
+                if self.channel_scales is not None:
+                    weight = weight * self.channel_scales.view(1, -1)
+                if self.pairs_grouped is not None:
+                    weight = scaled_pairwise_rotation(
+                        weight,
+                        self.pairs_grouped,
+                        self.angles_grouped,
+                        None,
+                        self.group_size,
+                    )
 
             self.quantizer = UniformAffineQuantizer(
                 weight,

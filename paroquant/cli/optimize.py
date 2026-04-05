@@ -66,7 +66,8 @@ class Config:
     # Calibration datasets. If more than one dataset is provided,
     # they will be sampled evenly and shuffled.
     datasets: list[str]
-    val_dataset: str
+    val_dataset: str = "pileval"
+    val_datasets: list[str] = field(default_factory=list)
     train_size: int
     validation_size: int
     batch_size: int
@@ -136,7 +137,9 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Load model.
-    model = load_model(args.model, device_map="cpu", dtype=torch.float16)
+    model = load_model(args.model, device_map="cpu", dtype="auto")
+    model_dtype = next(model.parameters()).dtype
+    logger.info("Loaded model with runtime dtype %s", model_dtype)
     move_embed(model, device)
     tokenizer = load_tokenizer(args.model)
     blocks = get_blocks(model)
@@ -152,14 +155,24 @@ def main():
     )
     samples = torch.stack(samples, dim=0).to(device)
 
-    val_samples = get_calib_dataset(
-        args.val_dataset,
-        tokenizer=tokenizer,
-        n_samples=args.validation_size,
-        block_size=args.seqlen,
-        seed=args.seed,
-        split="validation",
-    )
+    if args.val_datasets:
+        val_samples = get_mixed_calib_dataset(
+            args.val_datasets,
+            tokenizer=tokenizer,
+            n_samples=args.validation_size,
+            block_size=args.seqlen,
+            seed=args.seed,
+            split="validation",
+        )
+    else:
+        val_samples = get_calib_dataset(
+            args.val_dataset,
+            tokenizer=tokenizer,
+            n_samples=args.validation_size,
+            block_size=args.seqlen,
+            seed=args.seed,
+            split="validation",
+        )
     val_samples = torch.stack(val_samples, dim=0).to(device)
 
     # Capture first layer's input.
@@ -189,18 +202,25 @@ def main():
         input_batched: list[torch.Tensor],
         kwargs: dict,
         store_device: torch.device,
-        dtype: torch.dtype = torch.float16,
-        cast_to_dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype | None = None,
+        cast_to_dtype: torch.dtype | None = None,
     ) -> list[torch.Tensor]:
         output_batched = []
 
         layer.to(device)
+        layer_dtype = dtype
+        if layer_dtype is None:
+            try:
+                layer_dtype = next(layer.parameters()).dtype
+            except StopIteration:
+                layer_dtype = model_dtype
+        output_dtype = cast_to_dtype or layer_dtype
         for input_batch in input_batched:
-            output = layer(input_batch.to(dtype).to(device), **kwargs)
+            output = layer(input_batch.to(layer_dtype).to(device), **kwargs)
             if isinstance(output, tuple):
                 output = output[0]
-            if output.dtype != cast_to_dtype:
-                output = output.to(cast_to_dtype)
+            if output.dtype != output_dtype:
+                output = output.to(output_dtype)
             if output.device != store_device:
                 output = output.to(store_device)
             output_batched.append(output)
@@ -283,7 +303,7 @@ def main():
 
             all_pairs = [torch.tensor(pairs, device="cpu", dtype=torch.int32) for pairs in all_pairs]
             initial_angles = [torch.zeros(pairs.shape[0], device="cpu") for pairs in all_pairs]
-            initial_scales = torch.ones(1, weight.shape[1], dtype=torch.float16, device=device)
+            initial_scales = torch.ones(1, weight.shape[1], dtype=old_module.weight.dtype, device=device)
 
             npairs, angles, mask = transform_to_kernel_data(
                 all_pairs,
@@ -309,7 +329,7 @@ def main():
             old_module.cpu()
 
         if not all_files_exist:
-            layer.to(device).float()
+            layer.to(device=device, dtype=model_dtype)
 
             set_checkpointing_enabled(layer, args.checkpointing)
             layer_step = 0
@@ -383,7 +403,7 @@ def main():
         else:
             logger.info(f"Skipping optimization for layer {layer_idx}: already been optimized.")
 
-        layer.half().to(device)
+        layer.to(device=device, dtype=model_dtype)
 
         logger.info("Capturing new layer output...")
         new_layer_output_batches = forward_layer_batch(
