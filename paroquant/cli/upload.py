@@ -13,7 +13,12 @@ def main() -> None:
     parser.add_argument("--path-in-repo", type=str, default="", help="Optional subdirectory inside the repo.")
     parser.add_argument("--commit-message", type=str, default=None, help="Optional commit message.")
     parser.add_argument("--commit-description", type=str, default=None, help="Optional commit description.")
-    parser.add_argument("--private", action="store_true", help="Create the repo as private if it does not exist.")
+    parser.add_argument(
+        "--private",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create the repo as private if it does not exist. Use --no-private to create a public repo.",
+    )
     parser.add_argument("--create-pr", action="store_true", help="Upload via a pull request instead of directly.")
     args = parser.parse_args()
 
